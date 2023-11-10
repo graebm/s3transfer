@@ -25,7 +25,12 @@ from awscrt.io import (
     EventLoopGroup,
     TlsContextOptions,
 )
-from awscrt.s3 import S3Client, S3RequestTlsMode, S3RequestType
+from awscrt.s3 import (
+    S3Client,
+    S3RequestTlsMode,
+    S3RequestType,
+    S3ResponseError,
+)
 from botocore import UNSIGNED
 from botocore.compat import urlsplit
 from botocore.config import Config
@@ -171,6 +176,7 @@ class CRTTransferManager:
         self._s3_args_creator = S3ClientArgsCreator(
             crt_request_serializer, self._osutil
         )
+        self._crt_exception_translator = crt_request_serializer.translate_crt_exception
         self._future_coordinators = []
         self._semaphore = threading.Semaphore(128)  # not configurable
         # A counter to create unique id's for each transfer submitted.
@@ -262,7 +268,9 @@ class CRTTransferManager:
 
     def _submit_transfer(self, request_type, call_args):
         on_done_after_calls = [self._release_semaphore]
-        coordinator = CRTTransferCoordinator(transfer_id=self._id_counter)
+        coordinator = CRTTransferCoordinator(
+            transfer_id=self._id_counter,
+            exception_translator=self._crt_exception_translator)
         components = {
             'meta': CRTTransferMeta(self._id_counter, call_args),
             'coordinator': coordinator,
@@ -372,6 +380,9 @@ class BaseCRTRequestSerializer:
         :returns: An unsigned HTTP request to be used for the CRT S3 client
         """
         raise NotImplementedError('serialize_http_request()')
+
+    def translate_crt_exception(self, exception):
+        raise NotImplementedError('translate_crt_exception()')
 
 
 class BotocoreCRTRequestSerializer(BaseCRTRequestSerializer):
@@ -496,6 +507,32 @@ class BotocoreCRTRequestSerializer(BaseCRTRequestSerializer):
         crt_request = self._convert_to_crt_http_request(botocore_http_request)
         return crt_request
 
+    def translate_crt_exception(self, exception):
+        if isinstance(exception, S3ResponseError):
+            return self._translate_crt_s3_response_error(exception)
+        else:
+            return None
+
+    def _translate_crt_s3_response_error(self, s3_response_error):
+        status_code = s3_response_error.status_code
+        headers = botocore.awsrequest.HeadersDict()
+        for k, v in s3_response_error.headers:
+            headers[k] = v
+
+        response_dict = {
+            'headers': headers,
+            'status_code': status_code,
+            'body': s3_response_error.body,
+        }
+        parsed_response = self._client._response_parser.parse(response_dict, shape=None)  # TODO: shape
+
+        if status_code >= 300:
+            error_code = parsed_response.get("Error", {}).get("Code")
+            error_class = self._client.exceptions.from_code(error_code)
+            return error_class(parsed_response, operation_name="")  # TODO: operation_name
+        else:
+            return None
+
 
 class FakeRawResponse(BytesIO):
     def stream(self, amt=1024, decode_content=None):
@@ -509,9 +546,10 @@ class FakeRawResponse(BytesIO):
 class CRTTransferCoordinator:
     """A helper class for managing CRTTransferFuture"""
 
-    def __init__(self, transfer_id=None, s3_request=None):
+    def __init__(self, transfer_id=None, exception_translator=None):
         self.transfer_id = transfer_id
-        self._s3_request = s3_request
+        self._exception_translator = exception_translator
+        self._s3_request = None
         self._lock = threading.Lock()
         self._exception = None
         self._crt_future = None
@@ -543,11 +581,23 @@ class CRTTransferCoordinator:
             self._crt_future.result(timeout)
         except KeyboardInterrupt:
             self.cancel()
+            self._crt_future.result(timeout)
             raise
+        except Exception as e:
+            new_err = None
+            try:
+                if self._exception_translator:
+                    new_err = self._exception_translator(e)
+            except:
+                pass
+
+            if new_err:
+                raise new_err from e
+            else:
+                raise
         finally:
             if self._s3_request:
                 self._s3_request = None
-            self._crt_future.result(timeout)
 
     def done(self):
         if self._crt_future is None:
